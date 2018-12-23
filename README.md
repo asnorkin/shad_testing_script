@@ -5,7 +5,7 @@ Also it allows to check time and memory performance.
 
 ## Usage
 
-python -m pytest test_shad.py --solutions "<solution file path> <solution file path> ..." [--timeout <timeout in seconds>] [--memory <memory limit in bytes>] [--iterations <number_of_iterations>] [--input=<input file path>] [--log=<log level>]
+python -m pytest test_shad.py --solutions="<solution_file_path> <solution_file_path> ..." [--timeout=<timeout_in_seconds>] [--memory=<memory_limit_in_bytes>] [--iterations=<number_of_iterations>] [--input=<input_file_path>] [--log=<log_level>]
   
 python3.5 -m pytest test_shad.py --solutions "main.cpp naive.cpp" --timeout=0.5 --memory=65536 --iterations=1000
 
