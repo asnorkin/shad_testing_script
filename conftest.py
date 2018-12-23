@@ -1,10 +1,9 @@
-import functools
 import pytest
-import time
-import types
+import sys
+from inspect import isgeneratorfunction
 from logging import getLogger
 from subprocess import Popen, PIPE
-from input_token import get_token_generator
+from re import search
 from input_generation import user_input_generator
 
 
@@ -26,7 +25,7 @@ def get_input_generator(request, iterations):
         if not input:
             raise ValueError("No input data expression or file or user defined function specified")
 
-        if isinstance(input, types.GeneratorType):
+        if isgeneratorfunction(input):
             return input
         elif isinstance(input, list):
             return get_input_generator_from_list(input)
@@ -35,27 +34,9 @@ def get_input_generator(request, iterations):
                             "Expected: generator or list".format(type=type(input)))
 
     # File input
-    if input[0] not in ["[", "{", "("]:
-        with open(input, "r") as fin:
-            input = fin.readlines()
-        return get_input_generator_from_list(input)
-
-    tokens = input.split(DELIMITER)
-    token_generators = []
-    for token in tokens:
-        token_generator = get_token_generator(token)
-        token_generators.append(token_generator)
-
-    def _input_generator():
-        for _ in range(iterations):
-            input = []
-            for gen in token_generators:
-                s = next(gen())
-                input.append(s)
-
-            yield " ".join(input)
-
-    return _input_generator
+    with open(input, "r") as fin:
+        input = fin.readlines()
+    return get_input_generator_from_list(input)
 
 
 @pytest.fixture()
@@ -77,43 +58,154 @@ def input_generator(request, iterations):
 
 
 @pytest.fixture()
-def solutions(request):
-    return request.config.getoption("--solutions").split()
+def solutions(request, log):
+    _solutions = request.config.getoption("--solutions").split()
+    for _idx, _sol in enumerate(_solutions):
+        if _sol.rpartition(".")[-1] == "cpp":
+            _solutions[_idx] = compile_solution(_sol, log)
+            compile_solution(_sol, log, sanitizer=False)
+
+    return _solutions
 
 
 @pytest.fixture()
 def estimator(request, log):
-    timeout = request.config.getoption("--timeout")
-    memory_limit = request.config.getoption("--memory_limit")
+    timeout = float(request.config.getoption("--timeout"))
+    memory_limit = float(request.config.getoption("--memory_limit"))
     return get_estimator(timeout=timeout, memory_limit=memory_limit, log=log)
 
 
 def get_estimator(timeout, memory_limit, log):
     def _estimator(solution, input):
-        # TODO: memory check
-        start_memory = 0
-        start_time = time.time()
-        output = run_process(solution, input)
-        delta_time = time.time() - start_time
-        delta_memory = 0 - start_memory
-        if delta_time > timeout:
-            log.warning("Timout exceeded: {time}s > {timeout}s\n"
-                        "Solution: {solution}\n"
-                        "Input: {input}"
-                        .format(time=delta_time, timeout=timeout,
-                                solution=solution, input=input))
-        if delta_memory > memory_limit:
-            pass
-        return round(delta_time, 3), delta_memory, output
+        if "__naive" in solution:
+            solution_without_sanitizer = solution.rpartition(".")[0] + \
+                                         "_without_sanitizer" + "." + \
+                                         solution.rpartition(".")[-1]
+            output = run_process(solution_without_sanitizer, input, log)
+            return output.strip(), 0, 0
 
+        _time = run_process_with_time_check(solution, input, log)
+        if _time > timeout:
+            log.warning("Timout exceeded: {time}s > {timeout}s\n".format(time=_time, timeout=timeout))
+            log.warning("Solution: {solution}\n".format(solution=solution))
+            log.warning("Input: {input}\n".format(input=input))
+            log.warning("Trying to run without sanitizer..\n")
+
+            solution_without_sanitizer = solution.rpartition(".")[0] + \
+                                         "_without_sanitizer" + "." + \
+                                         solution.rpartition(".")[-1]
+            _time = run_process_with_time_check(solution_without_sanitizer, input, log)
+            if _time > timeout:
+                log.warning("Timeout exceeded without sanitizer: {time}s > {timeout}s\n"
+                            .format(time=_time, timeout=timeout))
+                log.warning("Solution: {solution}\n".format(solution=solution))
+                log.warning("Input: {input}\n".format(input=input))
+            else:
+                log.warning("Without sanitizer time is ok: {time}s < {timeout}s\n"
+                            .format(time=_time, timeout=timeout))
+
+        _mem = run_process_with_memory_check(solution, input, log)
+        if _mem > memory_limit:
+            log.warning("Memory limit exceeded: {mem}kb > {mem_limit}kb".format(mem=_mem, mem_limit=memory_limit))
+            log.warning("Solution: {solution}\n".format(solution=solution))
+            log.warning("Input: {input}\n".format(input=input))
+            log.warning("Trying to run without sanitizer..\n")
+
+            solution_without_sanitizer = solution.rpartition(".")[0] + \
+                                         "_without_sanitizer" + "." + \
+                                         solution.rpartition(".")[-1]
+            _mem = run_process_with_memory_check(solution_without_sanitizer, input, log)
+            if _mem > memory_limit:
+                log.warning("Memory limit exceeded without sanitizer: {mem}kb > {mem_limit}kb\n"
+                            .format(mem=_mem, mem_limit=memory_limit))
+                log.warning("Solution: {solution}\n".format(solution=solution))
+                log.warning("Input: {input}\n".format(input=input))
+            else:
+                log.warning("Without sanitizer memory is ok: {mem}kb < {mem_limit}kb\n"
+                            .format(mem=_mem, mem_limit=memory_limit))
+
+        output = run_process(solution, input, log)
+        return output.strip(), _time, _mem
     return _estimator
 
 
-def run_process(solution, input):
-    proc = Popen("./" + solution, stdin=PIPE, stdout=PIPE)
-    proc.stdin.write(bytes(input + "\n", "utf-8"))
-    proc.stdin.flush()
-    return str(proc.stdout.read())
+def compile_solution(solution, log, sanitizer=True):
+    if solution.rpartition(".")[-1] == "cpp":
+        sanitizer_suffix = "" if sanitizer else "_without_sanitizer"
+        compiled_solution = solution.rpartition(".")[0] + sanitizer_suffix + ".out"
+
+        args = ["g++",
+                solution,
+                "-fsanitize=address,undefined",
+                "-x",
+                "c++",
+                "-std=c++14",
+                "-O2",
+                # "-Wall",
+                # "-Werror",
+                # "-Wsign-compare",
+                "-o",
+                compiled_solution]
+        if not sanitizer:
+            del args[2]
+
+        proc = Popen(args, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+        compile_stdout, compile_stderr = proc.communicate()
+        if compile_stdout or compile_stderr:
+            err_msg = "Compilation error:\n" \
+                      "Solution: {}\n" \
+                      "STDOUT: {}\n" \
+                      "STDERR: {}\n"\
+                      .format(solution, str(compile_stdout.decode("utf-8")), str(compile_stderr.decode("utf-8")))
+            log.error(err_msg)
+            raise ValueError(err_msg)
+
+    else:
+        err_msg = "Trying to compile not .cpp file: {}".format(solution)
+        log.error(err_msg)
+        raise ValueError(err_msg)
+
+    return compiled_solution
+
+
+def run_process(solution, input, log):
+    proc = Popen("./" + solution, stdin=PIPE, stdout=PIPE, stderr=PIPE, shell=True)
+    stdout, stderr = proc.communicate(bytes(input + "\n", "utf-8"))
+    if stderr:
+        log.warning("Process' stderr is not empty after execution of {}:\n{}"
+                    .format(solution, str(stderr.decode("utf-8"))))
+
+    return str(stdout.decode("utf-8"))
+
+
+def run_process_with_time_check(solution, input, log):
+    if sys.platform == "linux":
+        proc = Popen('/usr/bin/time -f "\ntime: %E" ./' + solution, stdin=PIPE, stdout=PIPE, stderr=PIPE, shell=True)
+    elif sys.platform == "darwin":
+        proc = Popen('gtime -f "\ntime: %E" ./' + solution, stdin=PIPE, stdout=PIPE, stderr=PIPE, shell=True)
+    else:
+        log.error("Unsupported platform: {}.\n".format(sys.platform))
+        log.error("Expected linux or darwin")
+        raise ValueError
+
+    stdout, stderr = proc.communicate(bytes(input + "\n", "utf-8"))
+    minutes, seconds = search(r"time: ([\d]+):([\d]+.[\d]+)", str(stderr.decode("utf-8"))).groups()
+    return float(minutes) * 60 + float(seconds)
+
+
+def run_process_with_memory_check(solution, input, log):
+    if sys.platform == "linux":
+        proc = Popen('/usr/bin/time -f "\nmem: %M" ./' + solution, stdin=PIPE, stdout=PIPE, stderr=PIPE, shell=True)
+    elif sys.platform == "darwin":
+        proc = Popen('gtime -f "\nmem: %M" ./' + solution, stdin=PIPE, stdout=PIPE, stderr=PIPE, shell=True)
+    else:
+        log.error("Unsupported platform: {}.\n".format(sys.platform))
+        log.error("Expected linux or darwin")
+        raise ValueError
+
+    stdout, stderr = proc.communicate(bytes(input + "\n", "utf-8"))
+    (mem, ) = search(r"mem: (\d+)", str(stderr.decode("utf-8"))).groups()
+    return float(mem)
 
 
 def pytest_addoption(parser):
@@ -123,4 +215,3 @@ def pytest_addoption(parser):
     parser.addoption("--timeout", help="Timeout in seconds", default=1)
     parser.addoption("--memory_limit", help="Memory limit", default=1)
     parser.addoption("--log", help="Log level", default="INFO")
-
